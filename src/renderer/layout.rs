@@ -4164,6 +4164,90 @@ impl LayoutEngine {
         paper_images.sort_by_key(Self::paper_node_sort_key);
     }
 
+    /// 본문 단에 놓인 글앞/글뒤 개체를 같은 plane 의 용지 기준 개체와 한 z-order 축에 세운다.
+    ///
+    /// 용지 기준 개체(`paper_images`)는 본문 노드 뒤 root 에 붙어 plane 마다 본문보다 나중에
+    /// 재생된다. 그래서 문단 기준 글뒤 그림이 zOrder 가 더 작은 용지 기준 글뒤 표보다 먼저
+    /// 그려져 표 칸 배경에 가려진다. 한컴 2024 PDF 출력은 글뒤 표 6개(zOrder 0~5) 위에
+    /// 문단 기준 글뒤 직인 그림(zOrder 6)을 칸 배경과 칸 글자 위로 그린다 — 같은 text_wrap
+    /// 개체는 기준(용지/문단)과 무관하게 zOrder 로 쌓인다.
+    ///
+    /// 그 쪽의 용지 기준 개체와 plane 이 같을 때만 본문 단의 직속 개체를 옮긴다. 본문 안
+    /// 개체끼리의 순서, 글자처럼 취급(TAC) 개체, 칸·글상자 안 개체는 그대로 둔다.
+    fn lift_body_layered_objects(
+        body_node: &mut RenderNode,
+        paper_images: &mut Vec<RenderNode>,
+        paragraphs: &[Paragraph],
+        section_index: usize,
+    ) {
+        let paper_planes: Vec<u8> = paper_images
+            .iter()
+            .filter_map(|node| node.layer)
+            .filter(|layer| {
+                matches!(
+                    layer.text_wrap,
+                    Some(TextWrap::BehindText | TextWrap::InFrontOfText)
+                ) && !layer.master_page
+            })
+            .map(|layer| Self::render_layer_plane(Some(layer)))
+            .collect();
+        if paper_planes.is_empty() {
+            return;
+        }
+        for column in &mut body_node.children {
+            if !matches!(column.node_type, RenderNodeType::Column(_)) {
+                continue;
+            }
+            let mut kept = Vec::with_capacity(column.children.len());
+            for mut child in column.children.drain(..) {
+                match Self::body_object_layer(&child, paragraphs, section_index) {
+                    Some(layer)
+                        if paper_planes.contains(&Self::render_layer_plane(Some(layer))) =>
+                    {
+                        child.set_layer(layer);
+                        paper_images.push(child);
+                    }
+                    _ => kept.push(child),
+                }
+            }
+            column.children = kept;
+        }
+    }
+
+    fn body_object_layer(
+        node: &RenderNode,
+        paragraphs: &[Paragraph],
+        section_index: usize,
+    ) -> Option<RenderLayerInfo> {
+        let (node_section, para_index, control_index) = match &node.node_type {
+            RenderNodeType::Image(image) => {
+                (image.section_index, image.para_index?, image.control_index?)
+            }
+            RenderNodeType::Table(table) if table.cell_context.is_none() => {
+                (table.section_index, table.para_index?, table.control_index?)
+            }
+            _ => return None,
+        };
+        if node_section.is_some_and(|si| si != section_index) {
+            return None;
+        }
+        let control = paragraphs.get(para_index)?.controls.get(control_index)?;
+        let common = Self::control_common_attr(control)?;
+        if common.treat_as_char
+            || !matches!(
+                common.text_wrap,
+                TextWrap::BehindText | TextWrap::InFrontOfText
+            )
+        {
+            return None;
+        }
+        Some(
+            node.layer.unwrap_or_else(|| {
+                Self::render_layer_from_common(common, para_index, control_index)
+            }),
+        )
+    }
+
     /// [#6121] 셀 안 anchored(비 TAC) 개체를 셀 본문 텍스트 위로 올린다.
     ///
     /// 한글은 표 칸 문단에 앵커된 자리차지/어울림 개체(글 뒤로 제외)를 칸의 본문
@@ -4694,6 +4778,12 @@ impl LayoutEngine {
             };
         }
 
+        Self::lift_body_layered_objects(
+            &mut body_node,
+            &mut paper_images,
+            paragraphs,
+            page_content.section_index,
+        );
         tree.root.children.push(body_node);
 
         Self::sort_paper_render_nodes(&mut paper_images);
